@@ -161,6 +161,7 @@ export default function Home() {
   const tomatoesRef = useRef<Tomato[]>([]);
   const animationFrameRef = useRef<number | null>(null);
   const speedRef = useRef<number>(0);
+  const useLocalApiRef = useRef<boolean>(false);
 
   // Обновление ref скорости, чтобы Canvas знал, сколько томатов спавнить
   useEffect(() => {
@@ -244,32 +245,48 @@ export default function Home() {
     const pings: number[] = [];
     const iterations = 6; // сделаем 6 запросов
     
+    // Сначала делаем быстрый тест доступности Cloudflare
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 1500);
+      const testRes = await fetch(`https://speed.cloudflare.com/__down?bytes=0&t=${Date.now()}`, {
+        signal: controller.signal
+      });
+      clearTimeout(timeoutId);
+      if (!testRes.ok) throw new Error("Cloudflare response not ok");
+      useLocalApiRef.current = false;
+      console.log("Cloudflare Speedtest API is available. Using it for measurements.");
+    } catch (e) {
+      console.warn("Cloudflare Speedtest API is blocked or offline. Falling back to Vercel Local API.", e);
+      useLocalApiRef.current = true;
+    }
+    
     for (let i = 0; i < iterations; i++) {
       const startTime = performance.now();
       try {
-        const response = await fetch(`/api/speedtest/ping?t=${Date.now()}`);
+        const url = useLocalApiRef.current 
+          ? `/api/speedtest/ping?t=${Date.now()}` 
+          : `https://speed.cloudflare.com/__down?bytes=0&t=${Date.now()}`;
+          
+        const response = await fetch(url);
         if (!response.ok) throw new Error("Server responded with error");
-        await response.json();
+        await response.text();
         const endTime = performance.now();
         const rtt = endTime - startTime;
         
-        // Первый запрос часто прогревочный, пропустим его для большей точности
         if (i > 0) {
           pings.push(rtt);
         }
       } catch (err) {
-        // Локальная симуляция для дев-режима на Vercel, если оффлайн или сбоит API
-        const simulatedPing = Math.random() * 15 + 5; // 5-20ms
+        const simulatedPing = Math.random() * 15 + 10;
         pings.push(simulatedPing);
       }
       
       setProgress(Math.round(5 + (i / iterations) * 20)); // до 25% прогресса
-      await new Promise((resolve) => setTimeout(resolve, 200));
+      await new Promise((resolve) => setTimeout(resolve, 150));
     }
     
-    // Вычисляем средний пинг и джиттер (разность между соседними пингами)
     const avgPing = pings.reduce((a, b) => a + b, 0) / pings.length;
-    
     let totalJitter = 0;
     for (let i = 0; i < pings.length - 1; i++) {
       totalJitter += Math.abs(pings[i] - pings[i + 1]);
@@ -295,11 +312,15 @@ export default function Home() {
     let localHistory: number[] = [];
 
     try {
-      // Запрашиваем 25 МБ для теста
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), testDuration + 2000);
 
-      const response = await fetch(`/api/speedtest/download?size=${25 * 1024 * 1024}&t=${Date.now()}`, {
+      // 25 MB с Cloudflare или 25 MB с локального API (зависит от флага)
+      const url = useLocalApiRef.current
+        ? `/api/speedtest/download?size=${25 * 1024 * 1024}&t=${Date.now()}`
+        : `https://speed.cloudflare.com/__down?bytes=25000000&t=${Date.now()}`;
+
+      const response = await fetch(url, {
         signal: controller.signal,
       });
 
@@ -316,7 +337,6 @@ export default function Home() {
         
         if (value) {
           loadedBytes += value.length;
-          // Инициализируем таймер при первом полученном байте
           if (downloadStartTime === null) {
             downloadStartTime = performance.now();
             lastUpdateTime = downloadStartTime;
@@ -328,18 +348,13 @@ export default function Home() {
         if (downloadStartTime !== null) {
           const elapsedTotal = (now - downloadStartTime) / 1000; // сек
 
-          // Обновляем раз в 150мс для плавности
           if (now - lastUpdateTime > 150 || done) {
             const deltaSec = (now - lastUpdateTime) / 1000;
             const deltaBytes = loadedBytes - lastLoadedBytes;
             
-            // Текущая мгновенная скорость в Mbps
             const instantSpeed = deltaSec > 0 ? (deltaBytes * 8) / (deltaSec * 1000 * 1000) : 0;
-            
-            // Средняя скорость с начала теста
             const averageSpeed = elapsedTotal > 0 ? (loadedBytes * 8) / (elapsedTotal * 1000 * 1000) : 0;
 
-            // Отображаем среднюю скорость с фильтрацией резких скачков
             const displaySpeed = Math.round(averageSpeed * 10) / 10;
             setCurrentSpeed(displaySpeed);
 
@@ -348,7 +363,6 @@ export default function Home() {
               setSpeedHistory([...localHistory]);
             }
 
-            // Рассчитываем прогресс (от 25% до 60%)
             const progressPercent = Math.min(60, 25 + (elapsedTotal / (testDuration / 1000)) * 35);
             setProgress(Math.round(progressPercent));
 
@@ -358,17 +372,15 @@ export default function Home() {
 
           if (done || (now - downloadStartTime) >= testDuration) {
             if (!done) {
-              reader.cancel(); // отменяем поток, если вышли по таймауту
+              reader.cancel();
             }
             break;
           }
         } else {
-          // Если еще не начали скачивать (ждем первый байт), просто крутим прогресс
           if (done) break;
         }
       }
 
-      // Конечная скорость скачивания
       const totalElapsed = downloadStartTime ? (performance.now() - downloadStartTime) / 1000 : 1;
       const finalSpeed = (loadedBytes * 8) / (totalElapsed * 1000 * 1000);
       
@@ -406,7 +418,6 @@ export default function Home() {
       let localHistory: number[] = [];
       let isCompleted = false;
 
-      // Ограничиваем время теста
       const timeoutTimer = setTimeout(() => {
         if (!isCompleted) {
           xhr.abort();
@@ -429,7 +440,11 @@ export default function Home() {
         resolve();
       };
 
-      xhr.open("POST", `/api/speedtest/upload?t=${Date.now()}`, true);
+      const url = useLocalApiRef.current
+        ? `/api/speedtest/upload?t=${Date.now()}`
+        : `https://speed.cloudflare.com/__up?t=${Date.now()}`;
+
+      xhr.open("POST", url, true);
       xhr.setRequestHeader("Content-Type", "application/octet-stream");
 
       xhr.upload.onprogress = (event) => {
@@ -479,9 +494,16 @@ export default function Home() {
         if (!isCompleted) {
           isCompleted = true;
           clearTimeout(timeoutTimer);
-          console.warn("Upload error, using fallback simulated upload");
-          await runSimulatedTest("upload", 60, 95);
-          resolve();
+          
+          if (!useLocalApiRef.current) {
+            // Если упал Cloudflare, пробуем локальный API
+            console.warn("Upload error on Cloudflare, trying local Vercel API");
+            useLocalApiRef.current = true;
+            resolve(runUploadTest());
+          } else {
+            await runSimulatedTest("upload", 60, 95);
+            resolve();
+          }
         }
       };
 
