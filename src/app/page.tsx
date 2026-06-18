@@ -290,14 +290,14 @@ export default function Home() {
     setSpeedHistory([]);
 
     const testDuration = 7000; // 7 секунд на тест скачивания
-    const startTime = performance.now();
+    let downloadStartTime: number | null = null;
     let loadedBytes = 0;
     let localHistory: number[] = [];
 
     try {
       // Запрашиваем 25 МБ для теста
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), testDuration + 1000);
+      const timeoutId = setTimeout(() => controller.abort(), testDuration + 2000);
 
       const response = await fetch(`/api/speedtest/download?size=${25 * 1024 * 1024}&t=${Date.now()}`, {
         signal: controller.signal,
@@ -308,57 +308,68 @@ export default function Home() {
       if (!response.body) throw new Error("No download stream available");
       const reader = response.body.getReader();
       
-      let lastUpdateTime = startTime;
+      let lastUpdateTime = performance.now();
       let lastLoadedBytes = 0;
 
       while (true) {
         const { done, value } = await reader.read();
         
-        const now = performance.now();
-        const elapsedTotal = (now - startTime) / 1000; // сек
-        
         if (value) {
           loadedBytes += value.length;
+          // Инициализируем таймер при первом полученном байте
+          if (downloadStartTime === null) {
+            downloadStartTime = performance.now();
+            lastUpdateTime = downloadStartTime;
+          }
         }
 
-        // Обновляем раз в 150мс для плавности
-        if (now - lastUpdateTime > 150 || done) {
-          const deltaSec = (now - lastUpdateTime) / 1000;
-          const deltaBytes = loadedBytes - lastLoadedBytes;
-          
-          // Текущая мгновенная скорость в Mbps
-          const instantSpeed = deltaSec > 0 ? (deltaBytes * 8) / (deltaSec * 1000 * 1000) : 0;
-          
-          // Средняя скорость с начала теста
-          const averageSpeed = elapsedTotal > 0 ? (loadedBytes * 8) / (elapsedTotal * 1000 * 1000) : 0;
+        const now = performance.now();
+        
+        if (downloadStartTime !== null) {
+          const elapsedTotal = (now - downloadStartTime) / 1000; // сек
 
-          // Отображаем среднюю скорость с фильтрацией резких скачков
-          const displaySpeed = Math.round(averageSpeed * 10) / 10;
-          setCurrentSpeed(displaySpeed);
+          // Обновляем раз в 150мс для плавности
+          if (now - lastUpdateTime > 150 || done) {
+            const deltaSec = (now - lastUpdateTime) / 1000;
+            const deltaBytes = loadedBytes - lastLoadedBytes;
+            
+            // Текущая мгновенная скорость в Mbps
+            const instantSpeed = deltaSec > 0 ? (deltaBytes * 8) / (deltaSec * 1000 * 1000) : 0;
+            
+            // Средняя скорость с начала теста
+            const averageSpeed = elapsedTotal > 0 ? (loadedBytes * 8) / (elapsedTotal * 1000 * 1000) : 0;
 
-          if (instantSpeed > 0) {
-            localHistory.push(instantSpeed);
-            setSpeedHistory([...localHistory]);
+            // Отображаем среднюю скорость с фильтрацией резких скачков
+            const displaySpeed = Math.round(averageSpeed * 10) / 10;
+            setCurrentSpeed(displaySpeed);
+
+            if (instantSpeed > 0) {
+              localHistory.push(instantSpeed);
+              setSpeedHistory([...localHistory]);
+            }
+
+            // Рассчитываем прогресс (от 25% до 60%)
+            const progressPercent = Math.min(60, 25 + (elapsedTotal / (testDuration / 1000)) * 35);
+            setProgress(Math.round(progressPercent));
+
+            lastUpdateTime = now;
+            lastLoadedBytes = loadedBytes;
           }
 
-          // Рассчитываем прогресс (от 25% до 60%)
-          const progressPercent = Math.min(60, 25 + (elapsedTotal / (testDuration / 1000)) * 35);
-          setProgress(Math.round(progressPercent));
-
-          lastUpdateTime = now;
-          lastLoadedBytes = loadedBytes;
-        }
-
-        if (done || (now - startTime) >= testDuration) {
-          if (!done) {
-            reader.cancel(); // отменяем поток, если вышли по таймауту
+          if (done || (now - downloadStartTime) >= testDuration) {
+            if (!done) {
+              reader.cancel(); // отменяем поток, если вышли по таймауту
+            }
+            break;
           }
-          break;
+        } else {
+          // Если еще не начали скачивать (ждем первый байт), просто крутим прогресс
+          if (done) break;
         }
       }
 
       // Конечная скорость скачивания
-      const totalElapsed = (performance.now() - startTime) / 1000;
+      const totalElapsed = downloadStartTime ? (performance.now() - downloadStartTime) / 1000 : 1;
       const finalSpeed = (loadedBytes * 8) / (totalElapsed * 1000 * 1000);
       
       setResults((prev) => ({
@@ -368,7 +379,6 @@ export default function Home() {
 
     } catch (err: any) {
       console.warn("Download fetch error, using robust fallback", err);
-      // Робастный фоллбек на случай обрыва сети или CORS при деплое
       await runSimulatedTest("download", 25, 60);
     }
   };
@@ -389,8 +399,9 @@ export default function Home() {
 
     return new Promise<void>((resolve) => {
       const xhr = new XMLHttpRequest();
-      const startTime = performance.now();
-      let lastUpdateTime = startTime;
+      const requestStartTime = performance.now();
+      let uploadStartTime: number | null = null;
+      let lastUpdateTime = requestStartTime;
       let lastLoadedBytes = 0;
       let localHistory: number[] = [];
       let isCompleted = false;
@@ -406,8 +417,8 @@ export default function Home() {
       const finishTest = () => {
         isCompleted = true;
         clearTimeout(timeoutTimer);
-        const elapsed = (performance.now() - startTime) / 1000;
-        // Загруженное количество байт
+        const finalStartTime = uploadStartTime || requestStartTime;
+        const elapsed = (performance.now() - finalStartTime) / 1000;
         const uploaded = lastLoadedBytes;
         const finalSpeed = elapsed > 0 ? (uploaded * 8) / (elapsed * 1000 * 1000) : 0;
         
@@ -422,9 +433,15 @@ export default function Home() {
       xhr.setRequestHeader("Content-Type", "application/octet-stream");
 
       xhr.upload.onprogress = (event) => {
-        if (event.lengthComputable) {
+        if (event.lengthComputable && event.loaded > 0) {
           const now = performance.now();
-          const elapsedTotal = (now - startTime) / 1000;
+          
+          if (uploadStartTime === null) {
+            uploadStartTime = now;
+            lastUpdateTime = uploadStartTime;
+          }
+
+          const elapsedTotal = (now - uploadStartTime) / 1000;
           
           if (now - lastUpdateTime > 150) {
             const deltaSec = (now - lastUpdateTime) / 1000;
